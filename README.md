@@ -34,8 +34,11 @@ Do **not** copy `scripts/` or `Dockerfile` into this repo. CI runs:
 
 ```yaml
 - uses: actions/checkout@v4
-- uses: renglo/bom-helper/.github/actions/use-helper@main
+- uses: ./.github/actions/setup-bom-helper   # checkouts renglo/bom-helper
 ```
+
+Keep `.github/actions/setup-bom-helper` when you copy this template (it only
+wires the checkout; scripts stay in bom-helper).
 
 ## git-convoy
 
