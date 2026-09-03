@@ -1,0 +1,438 @@
+name: Deploy Backend (Staging -> Production tenants)
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "deploy_targets.yml"
+      - "bom/**"
+      - ".github/workflows/deploy.yml"
+  workflow_dispatch:
+    inputs:
+      skip_production:
+        description: "If true, only build/push and deploy staging"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: bom-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  prepare_matrix:
+    name: Prepare tenant matrix
+    runs-on: ubuntu-latest
+    outputs:
+      staging_matrix: ${{ steps.set-matrix.outputs.staging_matrix }}
+      production_matrix: ${{ steps.set-matrix.outputs.production_matrix }}
+      build_bom: ${{ steps.set-matrix.outputs.build_bom }}
+
+    steps:
+      - name: Checkout BOM repo
+        uses: actions/checkout@v4
+
+      - name: Setup bom-helper
+        uses: renglo/bom-helper/.github/actions/use-helper@main
+
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PyYAML
+        run: pip install pyyaml
+
+      - name: Build matrix JSON
+        id: set-matrix
+        run: |
+          set -euo pipefail
+          STAGING_JSON="$(python scripts/render_deploy_matrix.py deploy_targets.yml --pipeline backend --stage staging)"
+          PRODUCTION_JSON="$(python scripts/render_deploy_matrix.py deploy_targets.yml --pipeline backend --stage production)"
+          BUILD_BOM="$(python scripts/render_deploy_matrix.py deploy_targets.yml --build-bom)"
+          python scripts/bom_manifest.py --validate --pipeline backend "bom/v${BUILD_BOM}.json"
+          {
+            echo 'staging_matrix<<MATRIX_EOF'
+            echo "$STAGING_JSON"
+            echo 'MATRIX_EOF'
+            echo 'production_matrix<<MATRIX_EOF'
+            echo "$PRODUCTION_JSON"
+            echo 'MATRIX_EOF'
+            echo "build_bom=${BUILD_BOM}"
+          } >> "$GITHUB_OUTPUT"
+
+  build_image:
+    name: Build and push image (staging credentials)
+    runs-on: ubuntu-latest
+    needs:
+      - prepare_matrix
+    if: ${{ needs.prepare_matrix.outputs.staging_matrix != '{"include":[]}' }}
+    environment: staging
+    outputs:
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+      image_uri: ${{ steps.meta.outputs.image_uri }}
+
+    steps:
+      - name: Checkout BOM repo
+        uses: actions/checkout@v4
+
+      - name: Setup bom-helper
+        uses: renglo/bom-helper/.github/actions/use-helper@main
+
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PyYAML
+        run: pip install pyyaml
+
+      - name: Resolve staging deploy target
+        id: staging
+        run: |
+          set -euo pipefail
+          echo '${{ needs.prepare_matrix.outputs.staging_matrix }}' > staging_matrix.json
+          OIDC="$(jq -r '.include[0].oidc_role_arn' staging_matrix.json)"
+          REGION="$(jq -r '.include[0].aws_region' staging_matrix.json)"
+          SSM="$(jq -r '.include[0].ssm_parameter' staging_matrix.json)"
+          if [[ -z "$OIDC" || "$OIDC" == "null" ]]; then
+            echo "No staging matrix row for build_image." >&2
+            exit 1
+          fi
+          {
+            echo "oidc_role_arn=${OIDC}"
+            echo "aws_region=${REGION}"
+            echo "ssm_parameter=${SSM}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ steps.staging.outputs.oidc_role_arn }}
+          aws-region: ${{ steps.staging.outputs.aws_region }}
+
+      - name: Checkout BOM repos
+        id: repos
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python scripts/checkout_bom.py \
+            "bom/v${{ needs.prepare_matrix.outputs.build_bom }}.json" \
+            --pipeline backend
+
+      - name: Download python pins from CodeArtifact
+        if: ${{ steps.repos.outputs.has_python_pins == 'true' }}
+        run: |
+          set -euo pipefail
+          REGISTRY="$(python scripts/render_deploy_matrix.py deploy_targets.yml --registry)"
+          DOMAIN="${CODEARTIFACT_DOMAIN:-$(echo "$REGISTRY" | jq -r '.domain')}"
+          OWNER="${CODEARTIFACT_DOMAIN_OWNER:-$(echo "$REGISTRY" | jq -r '.domain_owner')}"
+          PYTHON_REPO="$(echo "$REGISTRY" | jq -r '.python_repository')"
+          CA_REGION="$(echo "$REGISTRY" | jq -r '.region')"
+          aws codeartifact login --tool pip \
+            --domain "${DOMAIN}" \
+            --domain-owner "${OWNER}" \
+            --repository "${PYTHON_REPO}" \
+            --region "${CA_REGION}"
+          python scripts/download_python_packages.py \
+            "bom/v${{ needs.prepare_matrix.outputs.build_bom }}.json" \
+            --dest wheels
+        env:
+          CODEARTIFACT_DOMAIN: ${{ vars.CODEARTIFACT_DOMAIN }}
+          CODEARTIFACT_DOMAIN_OWNER: ${{ vars.CODEARTIFACT_DOMAIN_OWNER }}
+
+      - name: Fetch ECR config from SSM
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          set -euo pipefail
+          python scripts/fetch_deploy_input.py \
+            --parameter "${{ steps.staging.outputs.ssm_parameter }}" \
+            --region "${{ steps.staging.outputs.aws_region }}" \
+            --output deploy_input.json \
+            --merge-secret OPENAI_API_KEY
+          ECR_REPOSITORY="$(jq -r '.VARS.AWS_ECR_REPOSITORY // empty' deploy_input.json)"
+          AWS_REGION="$(jq -r '.VARS.AWS_REGION // "${{ steps.staging.outputs.aws_region }}"' deploy_input.json)"
+          if [[ -z "${ECR_REPOSITORY}" ]]; then
+            echo "Missing VARS.AWS_ECR_REPOSITORY in SSM deploy-input." >&2
+            exit 1
+          fi
+          {
+            echo "ECR_REPOSITORY=${ECR_REPOSITORY}"
+            echo "AWS_REGION=${AWS_REGION}"
+          } >> "$GITHUB_ENV"
+
+      - name: Login to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push
+        id: meta
+        run: |
+          set -euo pipefail
+          ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
+          REGISTRY="${ACCOUNT}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          IMAGE_URI="${REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+          docker build \
+            -t "${IMAGE_URI}" \
+            -f Dockerfile \
+            .
+          docker push "${IMAGE_URI}"
+          echo "image_uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
+          echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+
+  deploy_staging_tenants:
+    name: Deploy staging tenant ${{ matrix.tenant }}-${{ matrix.stage }}
+    runs-on: ubuntu-latest
+    if: ${{ needs.prepare_matrix.outputs.staging_matrix != '{"include":[]}' }}
+    needs:
+      - prepare_matrix
+      - build_image
+    environment: staging
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare_matrix.outputs.staging_matrix) }}
+    concurrency:
+      group: deploy-staging-${{ matrix.tenant }}-${{ matrix.stage }}-${{ github.ref }}
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout BOM repo
+        uses: actions/checkout@v4
+
+      - name: Setup bom-helper
+        uses: renglo/bom-helper/.github/actions/use-helper@main
+
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ matrix.oidc_role_arn }}
+          aws-region: ${{ matrix.aws_region }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install boto3
+        run: pip install boto3
+
+      - name: Fetch deploy config and build Lambda env merge
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          set -euo pipefail
+          python scripts/fetch_deploy_input.py \
+            --parameter "${{ matrix.ssm_parameter }}" \
+            --region "${{ matrix.aws_region }}" \
+            --output deploy_input.json \
+            --merge-secret OPENAI_API_KEY \
+            --stage "${{ matrix.stage }}" \
+            --export-lambda-merge lambda_env_merge.json
+
+      - name: Deploy via CodeDeploy
+        run: |
+          set -euo pipefail
+          AWS_REGION="$(jq -r '.VARS.AWS_REGION // "${{ matrix.aws_region }}"' deploy_input.json)"
+          LAMBDA_FN="$(jq -r '.VARS.LAMBDA_FUNCTION_NAME // .VARS.LAMBDA_BACKEND_ARN // empty' deploy_input.json)"
+          ALIAS="$(jq -r '.VARS.LAMBDA_ALIAS // "${{ matrix.stage }}"' deploy_input.json)"
+          CODEDEPLOY_APP="$(jq -r '.VARS.CODEDEPLOY_APPLICATION_NAME // empty' deploy_input.json)"
+          CODEDEPLOY_GROUP="$(jq -r '.VARS.CODEDEPLOY_DEPLOYMENT_GROUP_NAME // empty' deploy_input.json)"
+          CODEDEPLOY_CONFIG="$(jq -r '.VARS.CODEDEPLOY_DEPLOYMENT_CONFIG_NAME // empty' deploy_input.json)"
+          if [[ -z "${LAMBDA_FN}" ]]; then
+            echo "Missing LAMBDA_FUNCTION_NAME or LAMBDA_BACKEND_ARN in SSM deploy-input." >&2
+            exit 1
+          fi
+          if jq -e 'length > 0' lambda_env_merge.json >/dev/null 2>&1; then
+            python scripts/deploy_lambda_codedeploy.py \
+              --function-name "${LAMBDA_FN}" \
+              --image-uri "${{ needs.build_image.outputs.image_uri }}" \
+              --alias-name "${ALIAS}" \
+              --application-name "${CODEDEPLOY_APP}" \
+              --deployment-group-name "${CODEDEPLOY_GROUP}" \
+              --deployment-config-name "${CODEDEPLOY_CONFIG}" \
+              --region "${AWS_REGION}" \
+              --merge-lambda-env-json lambda_env_merge.json \
+              --wait-deployment-success
+          else
+            python scripts/deploy_lambda_codedeploy.py \
+              --function-name "${LAMBDA_FN}" \
+              --image-uri "${{ needs.build_image.outputs.image_uri }}" \
+              --alias-name "${ALIAS}" \
+              --application-name "${CODEDEPLOY_APP}" \
+              --deployment-group-name "${CODEDEPLOY_GROUP}" \
+              --deployment-config-name "${CODEDEPLOY_CONFIG}" \
+              --region "${AWS_REGION}" \
+              --wait-deployment-success
+          fi
+
+  verify_staging:
+    name: Verify staging tenant ${{ matrix.tenant }}-${{ matrix.stage }}
+    runs-on: ubuntu-latest
+    if: ${{ needs.prepare_matrix.outputs.staging_matrix != '{"include":[]}' }}
+    needs:
+      - prepare_matrix
+      - deploy_staging_tenants
+    environment: staging
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare_matrix.outputs.staging_matrix) }}
+
+    steps:
+      - name: Checkout BOM repo
+        uses: actions/checkout@v4
+
+      - name: Setup bom-helper
+        uses: renglo/bom-helper/.github/actions/use-helper@main
+
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ matrix.oidc_role_arn }}
+          aws-region: ${{ matrix.aws_region }}
+
+      - name: Staging smoke check (/ping)
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          set -euo pipefail
+          python scripts/fetch_deploy_input.py \
+            --parameter "${{ matrix.ssm_parameter }}" \
+            --region "${{ matrix.aws_region }}" \
+            --output deploy_input.json \
+            --merge-secret OPENAI_API_KEY
+          BASE_URL="$(jq -r '.VARS.BASE_URL // empty' deploy_input.json)"
+          if [[ -z "${BASE_URL}" ]]; then
+            echo "Missing VARS.BASE_URL in SSM deploy-input." >&2
+            exit 1
+          fi
+          PING_URL="${BASE_URL%/}/ping"
+          echo "Smoke test URL: ${PING_URL}"
+          MAX_ATTEMPTS=5
+          SLEEP_SECONDS=10
+          SUCCESS=false
+          for attempt in $(seq 1 "${MAX_ATTEMPTS}"); do
+            echo "Smoke check attempt ${attempt}/${MAX_ATTEMPTS}..."
+            HTTP_CODE="$(curl -sS -o ping_response.json -w "%{http_code}" "${PING_URL}" 2>/dev/null)" || HTTP_CODE="000"
+            if [[ "${HTTP_CODE}" == "200" ]] && grep -Eq '"pong"[[:space:]]*:[[:space:]]*true' ping_response.json; then
+              SUCCESS=true
+              break
+            fi
+            echo "Ping failed with status ${HTTP_CODE}" >&2
+            cat ping_response.json || true
+            if [[ "${attempt}" -lt "${MAX_ATTEMPTS}" ]]; then
+              echo "Retrying in ${SLEEP_SECONDS}s..."
+              sleep "${SLEEP_SECONDS}"
+            fi
+          done
+          if [[ "${SUCCESS}" != "true" ]]; then
+            echo "Staging smoke check failed after ${MAX_ATTEMPTS} attempts." >&2
+            exit 1
+          fi
+          echo "Staging smoke check passed."
+
+  deploy_production_tenants:
+    name: Deploy production tenant ${{ matrix.tenant }}-${{ matrix.stage }}
+    runs-on: ubuntu-latest
+    if: ${{ (github.event_name != 'workflow_dispatch' || github.event.inputs.skip_production != 'true') && needs.prepare_matrix.outputs.production_matrix != '{"include":[]}' && (needs.deploy_staging_tenants.result == 'success' || needs.deploy_staging_tenants.result == 'skipped') && (needs.verify_staging.result == 'success' || needs.verify_staging.result == 'skipped') }}
+    needs:
+      - prepare_matrix
+      - build_image
+      - deploy_staging_tenants
+      - verify_staging
+    environment: production
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare_matrix.outputs.production_matrix) }}
+    concurrency:
+      group: deploy-production-${{ matrix.tenant }}-${{ matrix.stage }}-${{ github.ref }}
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout BOM repo
+        uses: actions/checkout@v4
+
+      - name: Setup bom-helper
+        uses: renglo/bom-helper/.github/actions/use-helper@main
+
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ matrix.oidc_role_arn }}
+          aws-region: ${{ matrix.aws_region }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install boto3
+        run: pip install boto3
+
+      - name: Fetch deploy config and build Lambda env merge
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          set -euo pipefail
+          python scripts/fetch_deploy_input.py \
+            --parameter "${{ matrix.ssm_parameter }}" \
+            --region "${{ matrix.aws_region }}" \
+            --output deploy_input.json \
+            --merge-secret OPENAI_API_KEY \
+            --stage "${{ matrix.stage }}" \
+            --export-lambda-merge lambda_env_merge.json
+
+      - name: Deploy via CodeDeploy
+        run: |
+          set -euo pipefail
+          AWS_REGION="$(jq -r '.VARS.AWS_REGION // "${{ matrix.aws_region }}"' deploy_input.json)"
+          LAMBDA_FN="$(jq -r '.VARS.LAMBDA_FUNCTION_NAME // .VARS.LAMBDA_BACKEND_ARN // empty' deploy_input.json)"
+          ALIAS="$(jq -r '.VARS.LAMBDA_ALIAS // "${{ matrix.stage }}"' deploy_input.json)"
+          CODEDEPLOY_APP="$(jq -r '.VARS.CODEDEPLOY_APPLICATION_NAME // empty' deploy_input.json)"
+          CODEDEPLOY_GROUP="$(jq -r '.VARS.CODEDEPLOY_DEPLOYMENT_GROUP_NAME // empty' deploy_input.json)"
+          CODEDEPLOY_CONFIG="$(jq -r '.VARS.CODEDEPLOY_DEPLOYMENT_CONFIG_NAME // empty' deploy_input.json)"
+          if [[ -z "${LAMBDA_FN}" ]]; then
+            echo "Missing LAMBDA_FUNCTION_NAME or LAMBDA_BACKEND_ARN in SSM deploy-input." >&2
+            exit 1
+          fi
+          if jq -e 'length > 0' lambda_env_merge.json >/dev/null 2>&1; then
+            python scripts/deploy_lambda_codedeploy.py \
+              --function-name "${LAMBDA_FN}" \
+              --image-uri "${{ needs.build_image.outputs.image_uri }}" \
+              --alias-name "${ALIAS}" \
+              --application-name "${CODEDEPLOY_APP}" \
+              --deployment-group-name "${CODEDEPLOY_GROUP}" \
+              --deployment-config-name "${CODEDEPLOY_CONFIG}" \
+              --region "${AWS_REGION}" \
+              --merge-lambda-env-json lambda_env_merge.json
+          else
+            python scripts/deploy_lambda_codedeploy.py \
+              --function-name "${LAMBDA_FN}" \
+              --image-uri "${{ needs.build_image.outputs.image_uri }}" \
+              --alias-name "${ALIAS}" \
+              --application-name "${CODEDEPLOY_APP}" \
+              --deployment-group-name "${CODEDEPLOY_GROUP}" \
+              --deployment-config-name "${CODEDEPLOY_CONFIG}" \
+              --region "${AWS_REGION}"
+          fi

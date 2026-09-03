@@ -1,0 +1,13 @@
+{
+  "version": "v0.1.0",
+  "created_at": "2026-09-03T00:00:00Z",
+  "description": "Template BOM. Replace pins with real published versions before enabling deploy.",
+  "python": {
+    "renglo-lib": "0.0.1",
+    "renglo-api": "0.0.1"
+  },
+  "npm": {
+    "@renglo/console": "0.0.1"
+  },
+  "repos": {}
+}

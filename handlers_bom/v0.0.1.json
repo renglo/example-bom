@@ -1,0 +1,11 @@
+{
+  "version": "v0.0.1",
+  "created_at": "2026-09-03T00:00:00Z",
+  "description": "Optional handlers BOM template. Delete this file (and handlers_bom: in deploy_targets.yml) if unused.",
+  "repos": {
+    "renglo/extensions-service": {
+      "url": "git@github.com:renglo/extensions-service.git",
+      "branch": "main"
+    }
+  }
+}

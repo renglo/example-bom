@@ -1,0 +1,168 @@
+name: Deploy Handlers (extensions-service)
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "deploy_targets.yml"
+      - "handlers_bom/**"
+      - ".github/workflows/deploy_handlers.yml"
+  workflow_dispatch:
+    inputs:
+      tenant:
+        description: "Optional tenant key (omit for all enabled tenants)"
+        required: false
+        default: ""
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: handlers-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare_matrix:
+    name: Prepare tenant matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+      handlers_bom: ${{ steps.set-matrix.outputs.handlers_bom }}
+
+    steps:
+      - name: Checkout BOM repo
+        uses: actions/checkout@v4
+
+      - name: Setup bom-helper
+        uses: renglo/bom-helper/.github/actions/use-helper@main
+
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PyYAML
+        run: pip install pyyaml
+
+      - name: Build matrix JSON
+        id: set-matrix
+        env:
+          TENANT_FILTER: ${{ github.event.inputs.tenant }}
+        run: |
+          set -euo pipefail
+          FILTER_ARGS=()
+          if [[ -n "${TENANT_FILTER}" ]]; then
+            FILTER_FILE="$(mktemp)"
+            printf '%s\n' "{\"include\":[{\"tenant\":\"${TENANT_FILTER}\"}]}" > "${FILTER_FILE}"
+            FILTER_ARGS=(--filter-json "${FILTER_FILE}")
+          fi
+          MATRIX="$(python scripts/render_deploy_matrix.py deploy_targets.yml --pipeline handlers "${FILTER_ARGS[@]}")"
+          HANDLERS_BOM="$(python scripts/render_deploy_matrix.py deploy_targets.yml --handlers-bom)"
+          python scripts/bom_manifest.py --validate --pipeline handlers "handlers_bom/v${HANDLERS_BOM}.json"
+          {
+            echo 'matrix<<MATRIX_EOF'
+            echo "$MATRIX"
+            echo 'MATRIX_EOF'
+            echo "handlers_bom=${HANDLERS_BOM}"
+          } >> "$GITHUB_OUTPUT"
+
+  deploy:
+    name: Deploy handlers ${{ matrix.tenant }} (${{ matrix.id }})
+    runs-on: ubuntu-latest
+    needs: prepare_matrix
+    if: ${{ needs.prepare_matrix.outputs.matrix != '{"include":[]}' }}
+    environment: ${{ matrix.deploy_stage }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare_matrix.outputs.matrix) }}
+    concurrency:
+      group: handlers-deploy-${{ matrix.tenant }}-${{ github.ref }}
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout BOM repo
+        uses: actions/checkout@v4
+
+      - name: Setup bom-helper
+        uses: renglo/bom-helper/.github/actions/use-helper@main
+
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Checkout handlers BOM repos
+        id: repos
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python scripts/checkout_bom.py \
+            "handlers_bom/v${{ needs.prepare_matrix.outputs.handlers_bom }}.json" \
+            --pipeline handlers
+
+      - name: Ensure deploy scripts are executable
+        run: chmod +x dev/extensions-service/scripts/*.sh
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ matrix.oidc_role_arn }}
+          aws-region: ${{ matrix.aws_region }}
+
+      - name: Fetch deploy_input.json from SSM
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          HANDLERS_COMPUTE: ${{ matrix.handlers_compute }}
+        run: |
+          set -euo pipefail
+          mkdir -p "dev/extensions-service/state/${{ matrix.id }}"
+          FETCH_ARGS=(
+            --parameter "${{ matrix.ssm_parameter }}"
+            --region "${{ matrix.aws_region }}"
+            --output "dev/extensions-service/state/${{ matrix.id }}/deploy_input.json"
+            --merge-secret OPENAI_API_KEY
+          )
+          if [[ "${HANDLERS_COMPUTE}" == "ecs" ]]; then
+            FETCH_ARGS+=(
+              --merge-parameter "ECS_VPC=/${{ matrix.id }}/bootstrap/ecs-vpc"
+              --merge-parameter "ECS_SUBNETS=/${{ matrix.id }}/bootstrap/ecs-subnets"
+              --merge-parameter "ECS_SECURITY_GROUPS=/${{ matrix.id }}/bootstrap/ecs-security-groups"
+            )
+          fi
+          python scripts/fetch_deploy_input.py "${FETCH_ARGS[@]}"
+
+      - name: Build handlers
+        env:
+          HANDLERS_COMPUTE: ${{ matrix.handlers_compute }}
+          HANDLERS_EXTENSION_REPO: ${{ steps.repos.outputs.handlers_extension_repo }}
+          HANDLERS_EXTRA_EXTENSIONS: ${{ steps.repos.outputs.handlers_extra_extensions }}
+        run: |
+          set -euo pipefail
+          BUILD_ARGS=()
+          if [[ "${HANDLERS_COMPUTE}" == "ecs" ]]; then
+            BUILD_ARGS+=(--large)
+          else
+            BUILD_ARGS+=(--no-ecs)
+          fi
+          if [[ -n "${HANDLERS_EXTENSION_REPO}" ]]; then
+            BUILD_ARGS+=(--extension-repo "${HANDLERS_EXTENSION_REPO}")
+          fi
+          if [[ -n "${HANDLERS_EXTRA_EXTENSIONS}" ]]; then
+            BUILD_ARGS+=(--extra-extensions "${HANDLERS_EXTRA_EXTENSIONS}")
+          fi
+          python3 dev/extensions-service/run.py "${{ matrix.id }}" build "${BUILD_ARGS[@]}"
+
+      - name: Deploy Lambda
+        run: |
+          set -euo pipefail
+          python3 dev/extensions-service/run.py "${{ matrix.id }}" deploy update
+
+      - name: Push ECS image
+        if: ${{ matrix.handlers_compute == 'ecs' }}
+        run: |
+          set -euo pipefail
+          python3 dev/extensions-service/run.py "${{ matrix.id }}" deploy push

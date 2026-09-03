@@ -1,0 +1,33 @@
+# Global BOM for the Docker build (all tenants share one image).
+# Omit to use the semver-latest bom/vX.Y.Z.json.
+bom: 0.1.0
+
+# Shared deploy scripts / Dockerfile (checked out by CI).
+helper:
+  repository: renglo/bom-helper
+  ref: main
+
+# Publisher CodeArtifact (pip/npm). domain_owner defaults to the first tenant account.
+registry:
+  domain: renglo
+  python_repository: python-store
+  npm_repository: npm-store
+
+# Handlers BOM → handlers_bom/vX.Y.Z.json (omit = latest).
+# handlers_bom: 0.0.1
+
+# Handlers compute: ecs (Lambda zip + ECS image) | lambda_only (zip only, no ecs-* SSM).
+# Omit to default to ecs.
+handlers_compute: lambda_only
+
+# Tenants: id is the AWS prefix shared by staging + production.
+tenants:
+  example:
+    id: example0000
+    aws_account: "000000000000"
+    aws_region: us-east-1
+    stages:
+      staging:
+        enabled: true
+      production:
+        enabled: false
