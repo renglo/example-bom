@@ -88,9 +88,19 @@ until infrastructure is wired.
 |------|------|
 | `bom/vX.Y.Z.json` | Backend + console package / git pins |
 | `handlers_bom/vX.Y.Z.json` | Optional external handlers pins |
-| `deploy_targets.yml` | Which versions to deploy, registry, tenants, helper pin |
+| `deploy_targets.yml` | Versions, `registries` (CodeArtifact publishers), tenants, helper pin |
 | `.github/workflows/*` | Deploy workflows (leave as-is unless you know why) |
 | `.github/actions/setup-bom-helper` | Checks out bom-helper in CI (leave as-is) |
+
+### CodeArtifact registries (vendor mosaic)
+
+Same-account packages work with **no** `registries` block (CI synthesizes an
+internal default from the first tenant account). To pull from other publishers,
+append one list entry per vendor under `registries:` (`domain`,
+`domain_owner`, repos, optional `npm_scopes`). Each foreign publisher must list
+this tenant in their publisher stack `reader_aws_accounts`, and the tenant
+launcher `package_registry.domain_owners` must include that publisher’s AWS
+account.
 
 Do **not** add a `scripts/` folder or a `Dockerfile` to this repo. CI does:
 

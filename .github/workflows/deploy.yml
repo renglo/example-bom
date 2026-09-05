@@ -137,16 +137,8 @@ jobs:
         if: ${{ steps.repos.outputs.has_python_pins == 'true' }}
         run: |
           set -euo pipefail
-          REGISTRY="$(python scripts/render_deploy_matrix.py deploy_targets.yml --registry)"
-          DOMAIN="${CODEARTIFACT_DOMAIN:-$(echo "$REGISTRY" | jq -r '.domain')}"
-          OWNER="${CODEARTIFACT_DOMAIN_OWNER:-$(echo "$REGISTRY" | jq -r '.domain_owner')}"
-          PYTHON_REPO="$(echo "$REGISTRY" | jq -r '.python_repository')"
-          CA_REGION="$(echo "$REGISTRY" | jq -r '.region')"
-          aws codeartifact login --tool pip \
-            --domain "${DOMAIN}" \
-            --domain-owner "${OWNER}" \
-            --repository "${PYTHON_REPO}" \
-            --region "${CA_REGION}"
+          REGISTRIES="$(python scripts/render_deploy_matrix.py deploy_targets.yml --registries)"
+          python scripts/configure_codeartifact.py --tool pip --registries-json "${REGISTRIES}"
           python scripts/download_python_packages.py \
             "bom/v${{ needs.prepare_matrix.outputs.build_bom }}.json" \
             --dest wheels

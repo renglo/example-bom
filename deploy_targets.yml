@@ -1,17 +1,27 @@
 # Global BOM for the Docker build (all tenants share one image).
 # Omit to use the semver-latest bom/vX.Y.Z.json.
-bom: 0.1.0
+bom: 0.1.1
 
 # Shared deploy scripts / Dockerfile (checked out by CI).
 helper:
   repository: renglo/bom-helper
   ref: main
 
-# Publisher CodeArtifact (pip/npm). domain_owner defaults to the first tenant account.
-registry:
-  domain: renglo
-  python_repository: python-store
-  npm_repository: npm-store
+# CodeArtifact publishers (vendor mosaic).
+# Omit registries (or use []) for same-account internal default only.
+# List foreign publishers here; each must grant this tenant via reader_aws_accounts,
+# and the tenant launcher package_registry.domain_owners must include their AWS account.
+# Entries without domain_owner use the first tenant aws_account (internal).
+registries:
+  - domain: arbitium
+    python_repository: python-store
+    npm_repository: npm-store
+    npm_scopes: ["@arbitium"]
+  - domain: renglo
+    domain_owner: "339713094352"
+    python_repository: python-store
+    npm_repository: npm-store
+    npm_scopes: ["@renglo"]
 
 # Handlers BOM → handlers_bom/vX.Y.Z.json (omit = latest).
 # handlers_bom: 0.0.1
@@ -23,8 +33,8 @@ handlers_compute: lambda_only
 # Tenants: id is the AWS prefix shared by staging + production.
 tenants:
   example:
-    id: example0000
-    aws_account: "000000000000"
+    id: arbitium0813
+    aws_account: "982081058012"
     aws_region: us-east-1
     stages:
       staging:

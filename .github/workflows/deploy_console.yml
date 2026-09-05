@@ -121,16 +121,8 @@ jobs:
           CODEARTIFACT_DOMAIN_OWNER: ${{ vars.CODEARTIFACT_DOMAIN_OWNER }}
         run: |
           set -euo pipefail
-          REGISTRY="$(python scripts/render_deploy_matrix.py deploy_targets.yml --registry)"
-          DOMAIN="${CODEARTIFACT_DOMAIN:-$(echo "$REGISTRY" | jq -r '.domain')}"
-          OWNER="${CODEARTIFACT_DOMAIN_OWNER:-$(echo "$REGISTRY" | jq -r '.domain_owner')}"
-          NPM_REPO="$(echo "$REGISTRY" | jq -r '.npm_repository')"
-          CA_REGION="$(echo "$REGISTRY" | jq -r '.region')"
-          aws codeartifact login --tool npm \
-            --domain "${DOMAIN}" \
-            --domain-owner "${OWNER}" \
-            --repository "${NPM_REPO}" \
-            --region "${CA_REGION}"
+          REGISTRIES="$(python scripts/render_deploy_matrix.py deploy_targets.yml --registries)"
+          python scripts/configure_codeartifact.py --tool npm --registries-json "${REGISTRIES}"
 
       - name: Materialize console host
         if: ${{ steps.repos.outputs.has_console_pin == 'true' }}
